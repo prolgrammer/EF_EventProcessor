@@ -1,0 +1,184 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EventFlow — event-processor dev stack
+# ─────────────────────────────────────────────────────────────────────────────
+# Services:
+#   kafka          — single-node Kafka in KRaft mode (no Zookeeper)
+#   kafka-init     — one-shot container that creates the required topics
+#   clickhouse     — single-node ClickHouse with schema auto-init
+#   event-processor— the Go service
+#   prometheus     — metrics collection
+#   grafana        — dashboards (login: admin/admin)
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  eventflow:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── Kafka (KRaft mode, single broker) ──────────────────────────────────────
+  # Используем официальный образ apache/kafka (Apache Software Foundation).
+  # Работает в KRaft-режиме без ZooKeeper. CLUSTER_ID фиксируем статически,
+  # чтобы данные тома не расходились при пересоздании контейнера.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: ef-kafka
+    networks: [eventflow]
+    ports:
+      - "9092:9092"   # внутренний (inter-container)
+      - "9094:9094"   # внешний (для тестового скрипта с хоста)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Фиксированный Cluster ID (base64 UUID) — нужен при монтировании тома.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  # ── Kafka topic initialisation ─────────────────────────────────────────────
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: ef-kafka-init
+    networks: [eventflow]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events.raw   --partitions 6 --replication-factor 1 --config retention.ms=86400000
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events.valid --partitions 6 --replication-factor 1 --config retention.ms=21600000
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic events.dlq   --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      echo 'Topics created:'
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+      "
+    restart: "no"
+
+  # ── ClickHouse ─────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: ef-clickhouse
+    networks: [eventflow]
+    ports:
+      - "9000:9000"   # native protocol
+      - "8123:8123"   # HTTP interface (handy for curl queries)
+    environment:
+      - CLICKHOUSE_DB=eventflow
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./deploy/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ── event-processor ────────────────────────────────────────────────────────
+  event-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ef-event-processor
+    networks: [eventflow]
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_GROUP_ID=processor
+      - KAFKA_TOPIC_RAW=events.raw
+      - KAFKA_TOPIC_VALID=events.valid
+      - KAFKA_TOPIC_DLQ=events.dlq
+      - CLICKHOUSE_ADDR=clickhouse:9000
+      - CLICKHOUSE_DB=eventflow
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_BATCH_SIZE=1000
+      - CLICKHOUSE_FLUSH_INTERVAL=1s
+      - HTTP_ADDR=:8080
+      - VALIDATOR_WORKERS=4
+      - ENRICHER_WORKERS=4
+      - SESSION_IDLE_TIMEOUT=30m
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q 'ok' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: ef-prometheus
+    networks: [eventflow]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    depends_on:
+      - event-processor
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: ef-grafana
+    networks: [eventflow]
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
